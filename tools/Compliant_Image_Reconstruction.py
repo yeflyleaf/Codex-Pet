@@ -1,10 +1,6 @@
 from pathlib import Path
-
-# pyrefly: ignore [missing-import]
 import numpy as np
-# pyrefly: ignore [missing-import]
-from PIL import Image
-# pyrefly: ignore [missing-import]
+from PIL import Image, ImageOps, UnidentifiedImageError
 from scipy import ndimage
 
 # Codex-Pet V2 硬性规格常量 (8列 x 11行, 单帧 192x208, 总尺寸 1536x2288)
@@ -12,6 +8,83 @@ CODEX_V2_COLS: int = 8
 CODEX_V2_ROWS: int = 11
 CODEX_V2_FRAME_W: int = 192
 CODEX_V2_FRAME_H: int = 208
+
+
+def _get_supported_extensions() -> set[str]:
+    """动态获取当前 Pillow 环境支持读取的所有图片扩展名。"""
+    Image.init()
+    return {
+        ext.lower()
+        for ext, fmt in Image.registered_extensions().items()
+        if fmt in Image.OPEN
+    }
+
+
+SUPPORTED_IMAGE_EXTS: set[str] = _get_supported_extensions()
+
+
+def _is_valid_image_file(file_path: Path) -> bool:
+    """校验文件是否为受支持且可正常解码的图像文件（不局限于扩展名）。"""
+    if not file_path.is_file():
+        return False
+    try:
+        with Image.open(file_path) as test_img:
+            test_img.verify()
+        return True
+    except (UnidentifiedImageError, OSError, ValueError):
+        return False
+
+
+def _resolve_input_image(
+    input_path: str | Path,
+    exclude_output: Path | None = None,
+) -> Path:
+    """智能解析输入图片路径，支持任意图片格式：
+    1. 若传入路径精确存在且为有效图片，直接使用；
+    2. 若传入 './assets/1.png' 或 './assets/1' 但实际文件是 '1.jpg'/'1.webp' 等，自动匹配同名任意格式图片；
+    3. 若传入的是目录（如 './assets'），自动查找该目录下第一个有效图片文件（排除输出文件）。
+    """
+    raw_path = Path(input_path)
+    exclude_resolved = exclude_output.resolve() if exclude_output and exclude_output.exists() else None
+
+    # 情况 1：路径直接存在且是文件
+    if raw_path.is_file():
+        if _is_valid_image_file(raw_path):
+            return raw_path
+        raise ValueError(f"文件存在但不是有效的图像格式: {raw_path.resolve()}")
+
+    # 情况 2：传入的是目录，扫描目录内所有有效图片
+    if raw_path.is_dir():
+        candidates = sorted(
+            p for p in raw_path.iterdir()
+            if p.is_file()
+            and (exclude_resolved is None or p.resolve() != exclude_resolved)
+            and (p.suffix.lower() in SUPPORTED_IMAGE_EXTS or _is_valid_image_file(p))
+        )
+        for candidate in candidates:
+            if _is_valid_image_file(candidate):
+                return candidate
+        raise FileNotFoundError(f"目录中未找到任何可用的图像文件: {raw_path.resolve()}")
+
+    # 情况 3：文件不存在（例如写死 1.png 或无后缀 1，实际存放的是 1.jpg / 1.bmp 等）
+    parent_dir = raw_path.parent
+    target_stem = raw_path.stem
+    if parent_dir.is_dir():
+        # 优先匹配同主文件名（如 1.*）的任意图像格式
+        same_stem_candidates = sorted(
+            p for p in parent_dir.glob(f"{target_stem}.*")
+            if p.is_file()
+            and (exclude_resolved is None or p.resolve() != exclude_resolved)
+        )
+        for candidate in same_stem_candidates:
+            if candidate.suffix.lower() in SUPPORTED_IMAGE_EXTS or _is_valid_image_file(candidate):
+                if _is_valid_image_file(candidate):
+                    return candidate
+
+    raise FileNotFoundError(
+        f"未找到匹配的输入图像文件: {raw_path.resolve()} "
+        f"(已尝试自动检索同目录下 '{target_stem}.*' 的所有图片类型)"
+    )
 
 
 def _build_internal_dark_mask(
@@ -85,12 +158,18 @@ def remove_black_bg_for_spritesheet(
     soft_threshold: int = 55,
     max_hole_area: int = 160,
 ) -> None:
-    src_file = Path(input_path)
-    if not src_file.exists():
-        raise FileNotFoundError(f"未找到输入图像文件: {src_file.resolve()}")
+    dst_file = Path(output_path)
+    src_file = _resolve_input_image(input_path, exclude_output=dst_file)
 
-    # 1. 读取图像并转换为 RGBA 浮点数组
-    img = Image.open(src_file).convert("RGBA")
+    # 1. 读取任意格式图像，处理 EXIF 旋转信息（针对 JPG/WebP 等），并统一转换为 RGBA 浮点数组
+    with Image.open(src_file) as raw_img:
+        img_format = raw_img.format or src_file.suffix.upper()
+        # 若为 GIF/WebP/APNG 等多帧图像，默认取第一帧（序列图本身应为单张大图）
+        if getattr(raw_img, "is_animated", False):
+            raw_img.seek(0)
+        oriented_img = ImageOps.exif_transpose(raw_img)
+        img = oriented_img.convert("RGBA")
+
     data = np.array(img, dtype=np.float32)
     rgb = data[:, :, :3]
     orig_alpha = data[:, :, 3]
@@ -122,7 +201,7 @@ def remove_black_bg_for_spritesheet(
         (max_rgb[transition_mask] - noise_floor) / (soft_threshold - noise_floor)
     ) * 255.0
 
-    # 结合原图自带的 Alpha 通道（若输入本身为带透明度的 PNG）
+    # 结合原图自带的 Alpha 通道（兼容带透明度的 PNG/WebP 及无透明度的 JPG/BMP）
     alpha = np.minimum(alpha, orig_alpha)
 
     # 4. 颜色反乘（Unmultiply）：去除半透明边缘混入的黑色底色，恢复原本鲜艳色彩
@@ -155,23 +234,23 @@ def remove_black_bg_for_spritesheet(
         f"尺寸校验失败: 当前 {final_img.size}, 预期 {expected_size}"
     )
 
-    dst_file = Path(output_path)
     dst_file.parent.mkdir(parents=True, exist_ok=True)
     final_img.save(dst_file, format="WEBP", lossless=True, quality=100, method=6)
 
     print(
-        f"处理完成: {dst_file} | "
+        f"处理完成: 输入 [{src_file.name} ({img_format})] -> 输出 [{dst_file}] | "
         f"最终尺寸: {expected_size[0]}x{expected_size[1]} "
         f"(网格: {cols}列x{rows}行, 单帧: {frame_w}x{frame_h})"
     )
 
 
 if __name__ == "__main__":
-    # 将输入文件名替换为保存的图片路径，输出直接命名为 pet.json 所需的 WebP 文件
+    # 支持以下任意传参方式：
+    # 1. 传 "./assets/1.png" 或 "./assets/1"：会自动匹配 1.png、1.jpg、1.jpeg、1.webp、1.bmp 等任意格式
+    # 2. 传 "./assets"：会自动识别该目录下第一个有效的源图片文件并处理
     remove_black_bg_for_spritesheet(
-        input_path="./assets/demo.png",
-        output_path="./assets/demo.webp",
+        input_path="./assets/1",
+        output_path="./assets/2.webp",
         cols=8,
         rows=11,
     )
-    
