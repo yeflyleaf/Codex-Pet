@@ -1,0 +1,24 @@
+# Image processing and matrix operations
+Pillow==11.3.0
+numpy==2.0.2
+scipy==1.13.1
+
+# Code style and type checking
+mypy==1.19.1
+mypy_extensions==1.1.0
+ruff==0.17.0
+typing_extensions==4.16.0
+pathspec==1.1.1
+
+# Terminal output
+colorama==0.4.6
+Pygments==2.21.0
+
+# Testing framework
+pytest==8.4.2
+iniconfig==2.1.0
+pluggy==1.6.0
+
+# Build and metadata
+librt==0.16.0
+packaging==26.3
